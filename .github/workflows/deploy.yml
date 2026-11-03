@@ -1,18 +1,16 @@
 name: wxread
 
-# 关键：改成 false。任务要跑 1 小时，多个 cron 若设为 true 会互相取消
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
 on:
   schedule:
-    # 北京时间 01:00 —— 主时段
-    - cron: '0 17 * * *'
-    # 北京时间 05:30 —— 兜底（与主时段间隔 4.5h，不会和 1h 的任务重叠）
-    - cron: '30 21 * * *'
-    # 北京时间 12:30 —— 第二道兜底
-    - cron: '30 4 * * *'
+    # cron 一律按 UTC，注释标注北京时间（UTC+8）
+    - cron: '0 17 * * *'    # 北京次日 01:00 —— 主时段
+    - cron: '30 21 * * *'   # 北京次日 05:30 —— 兜底
+    - cron: '30 4 * * *'    # 北京 12:30 —— 兜底
+    - cron: '30 10 * * *'   # 北京 18:30 —— 兜底
   workflow_dispatch:
 
 jobs:
@@ -20,24 +18,37 @@ jobs:
     runs-on: ubuntu-22.04
     environment: AutoRead
     permissions:
-      actions: read    # 供 gh api 查询当天运行记录
+      actions: read
       contents: read
 
     steps:
-      - name: Check if already succeeded today
+      - name: Check if already succeeded today (Beijing time)
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          N=$(gh api "repos/${{ github.repository }}/actions/workflows/deploy.yml/runs?created=>=${TODAY}&per_page=100" \
-                --jq '[.workflow_runs[] | select(.conclusion=="success")] | length' 2>/dev/null || echo 0)
-          echo "今日已有成功运行数: $N"
+          # 纯 epoch 算术换算北京时间，不解析日期字符串，避免时区/解析差异
+          NOW=$(date -u +%s)
+          CN_NOW=$((NOW + 28800))                      # UTC+8 的 epoch
+          CN_DAY_START=$((CN_NOW - CN_NOW % 86400))    # 向下取整到北京当天 00:00
+          SINCE_EPOCH=$((CN_DAY_START - 28800))        # 换回 UTC
+          TODAY_CN=$(date -u -d "@${CN_DAY_START}" +%Y-%m-%d)
+          SINCE=$(date -u -d "@${SINCE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)
+          echo "北京今天: ${TODAY_CN}  |  统计起点(UTC): ${SINCE}"
+
+          # 只统计"真正跑过"的成功运行：耗时 > 10 分钟
+          # 原因：Skip 那次的结论也是 success（约 15 秒），不过滤会导致连环跳过
+          N=$(gh api "repos/${{ github.repository }}/actions/workflows/deploy.yml/runs?created=>=${SINCE}&per_page=100" \
+                --jq '[.workflow_runs[]
+                       | select(.conclusion=="success")
+                       | select(((.updated_at|fromdate) - (.created_at|fromdate)) > 600)
+                      ] | length' 2>/dev/null || echo 0)
+          echo "北京今天有效运行数(>10分钟): $N"
           echo "runs=$N" >> $GITHUB_OUTPUT
 
       - name: Skip (already done today)
         if: ${{ steps.check.outputs.runs != '0' }}
-        run: echo "今天已经成功跑过，跳过本次触发，避免重复阅读触发风控。"
+        run: echo "北京时间今天已完成，跳过本次触发。"
 
       - name: Checkout repository
         if: ${{ steps.check.outputs.runs == '0' }}
